@@ -238,3 +238,13 @@ embedding_cache/
 
 # deep eval
 .deepeval/
+
+# OS metadata
+.DS_Store
+
+# Local storage and Qdrant database
+qdrant_storage/
+data/
+
+# Python cache / virtual envs
+*.pyc
