@@ -2,6 +2,7 @@
 
 > Upload research papers. Ask questions. Verify claims. Get grounded, faithful answers — never hallucinations.
 
+🚀 **Live Demo**: [http://18.234.72.206](http://18.234.72.206)
 
 ---
 
