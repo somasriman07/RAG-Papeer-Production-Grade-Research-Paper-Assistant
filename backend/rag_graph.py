@@ -1,6 +1,11 @@
+import hashlib
+import logging
 import os
+import re
 import sqlite3
+import time
 import warnings
+from collections import defaultdict
 from typing import Annotated
 
 warnings.filterwarnings("ignore", message="The default value of `allowed_objects`")
@@ -23,7 +28,173 @@ from backend.vector_store import search as vs_search
 
 load_dotenv()
 
-llm = ChatOpenAI(model="gpt-5.4-mini")
+# ── Audit Logger ──────────────────────────────────────────────────────────────
+# Writes structured logs to rag_audit.log for every node, routing decision,
+# tool call, guardrail trigger, and rate-limit event. Completely separate from
+# stdout so your terminal output stays clean.
+
+logging.basicConfig(
+    filename="rag_audit.log",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+audit = logging.getLogger("rag_audit")
+
+
+def log_event(event: str, session_id: str, detail: str = "") -> None:
+    """Central audit log call — all guardrail/routing/tool events go here."""
+    safe_session = hashlib.sha256(session_id.encode()).hexdigest()[:12]
+    audit.info(f"event={event} | session={safe_session} | {detail}")
+
+
+# ── Rate & Abuse Prevention ───────────────────────────────────────────────────
+# Two-layer defence:
+#   1. Per-session request rate limiter (max N queries per time window).
+#   2. Wallet-attack cap: hard limit on total LLM calls a session can trigger,
+#      preventing prompt-injection loops that try to exhaust your API credits.
+
+RATE_LIMIT_MAX_REQUESTS  = 10    # max queries per session per window
+RATE_LIMIT_WINDOW_SEC    = 60    # rolling window in seconds
+WALLET_MAX_LLM_CALLS     = 15    # hard cap on total LLM calls per session
+                                  # (router + agent + relevancy + rewrite + generate = ~5-7 per query)
+
+# In-memory stores — fine for single-process eval; swap for Redis in prod.
+_session_request_log: dict[str, list[float]] = defaultdict(list)
+_session_llm_call_count: dict[str, int]      = defaultdict(int)
+
+
+def check_rate_limit(session_id: str) -> None:
+    """Raises RuntimeError if session has exceeded request rate or wallet cap."""
+    now = time.time()
+
+    # 1. Wallet attack: total LLM call budget
+    if _session_llm_call_count[session_id] >= WALLET_MAX_LLM_CALLS:
+        log_event("WALLET_CAP_EXCEEDED", session_id,
+                  f"llm_calls={_session_llm_call_count[session_id]}")
+        raise RuntimeError(
+            f"[SECURITY] Session exceeded maximum LLM call budget ({WALLET_MAX_LLM_CALLS}). "
+            "This may indicate a prompt-injection loop. Session is halted."
+        )
+
+    # 2. Request rate: queries per rolling window
+    window_start = now - RATE_LIMIT_WINDOW_SEC
+    _session_request_log[session_id] = [
+        t for t in _session_request_log[session_id] if t > window_start
+    ]
+    if len(_session_request_log[session_id]) >= RATE_LIMIT_MAX_REQUESTS:
+        log_event("RATE_LIMIT_EXCEEDED", session_id,
+                  f"requests_in_window={len(_session_request_log[session_id])}")
+        raise RuntimeError(
+            f"[SECURITY] Rate limit exceeded: more than {RATE_LIMIT_MAX_REQUESTS} "
+            f"requests in {RATE_LIMIT_WINDOW_SEC}s. Please slow down."
+        )
+
+    _session_request_log[session_id].append(now)
+
+
+def increment_llm_calls(session_id: str, node: str) -> None:
+    """Track each LLM invocation against the wallet cap."""
+    _session_llm_call_count[session_id] += 1
+    log_event("LLM_CALL", session_id,
+              f"node={node} | total_calls={_session_llm_call_count[session_id]}")
+
+
+# ── Access Control ────────────────────────────────────────────────────────────
+# Validates that session_ids are structurally legitimate (matching your known
+# format) before any processing occurs. Rejects arbitrary/injected session IDs
+# that could be used to cross-contaminate vector store collections.
+
+_VALID_SESSION_RE = re.compile(
+    r"^[a-zA-Z0-9_\-]{4,128}$"   # alphanumeric + underscore/dash, 4–128 chars
+)
+
+
+def validate_session_id(session_id: str) -> None:
+    """Raises ValueError if session_id doesn't match the expected format."""
+    if not _VALID_SESSION_RE.match(session_id):
+        log_event("INVALID_SESSION_ID", session_id or "EMPTY",
+                  f"rejected_value={repr(session_id[:60])}")
+        raise ValueError(
+            f"[SECURITY] Invalid session_id format: {repr(session_id[:60])}. "
+            "Session IDs must be alphanumeric (4–128 chars)."
+        )
+
+
+# ── Output Sanitization ───────────────────────────────────────────────────────
+# Strips prompt-injection patterns from LLM outputs before they reach the user
+# or get stored in state. Also prevents the model from leaking system prompt
+# instructions or internal tags through its answers.
+
+_INJECTION_PATTERNS = [
+    re.compile(r"ignore\s+(all\s+)?previous\s+instructions?", re.IGNORECASE),
+    re.compile(r"you\s+are\s+now\s+a?\s*(DAN|jailbreak|unrestricted)", re.IGNORECASE),
+    re.compile(r"<\s*system\s*>.*?<\s*/\s*system\s*>", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\[INST\].*?\[/INST\]", re.DOTALL),
+    re.compile(r"<\|.*?\|>"),           # model-specific control tokens
+    re.compile(r"#+\s*(system|prompt|instructions?)\s*:", re.IGNORECASE),
+]
+
+# Hard cap on output length — prevents the model generating multi-MB responses
+# that could exhaust memory or cause downstream issues.
+MAX_OUTPUT_CHARS = 4000
+
+
+def sanitize_output(text: str, session_id: str) -> str:
+    """Strip injection patterns and cap output length. Logs every triggered rule."""
+    for pattern in _INJECTION_PATTERNS:
+        if pattern.search(text):
+            log_event("OUTPUT_SANITIZED", session_id,
+                      f"pattern={pattern.pattern[:60]}")
+            text = pattern.sub("[REDACTED]", text)
+
+    if len(text) > MAX_OUTPUT_CHARS:
+        log_event("OUTPUT_TRUNCATED", session_id,
+                  f"original_len={len(text)} | truncated_to={MAX_OUTPUT_CHARS}")
+        text = text[:MAX_OUTPUT_CHARS] + "\n\n*[Response truncated for safety.]*"
+
+    return text
+
+
+# ── Context Length Management ─────────────────────────────────────────────────
+# If retrieved context is large, trim it and inject a length-control instruction
+# so the LLM produces a medium-length answer rather than a verbose dump that
+# tanks your AnswerRelevancy score (confirmed issue from your eval results).
+
+CONTEXT_CHAR_LIMIT   = 3000   # max chars fed to generate_answer_node as context
+CONTEXT_CHUNK_LIMIT  = 3      # max chunks used for generation regardless of k
+
+
+def build_context_and_prompt(docs: list[Document], query: str) -> str:
+    trimmed = docs[:CONTEXT_CHUNK_LIMIT]
+    context = "\n\n---\n\n".join(doc.page_content for doc in trimmed)
+    if len(context) > CONTEXT_CHAR_LIMIT:
+        context = context[:CONTEXT_CHAR_LIMIT]
+
+    return (
+        f"Answer the question in 2-3 sentences using ONLY the context below.\n"
+        f"Do NOT add examples, metrics, or BLEU scores unless the question asks for them.\n"
+        f"Do NOT make claims not explicitly stated in the context.\n"
+        f"If the context is ambiguous, say so rather than guessing.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {query}"
+    )
+
+
+# ── LLM Clients ──────────────────────────────────────────────────────────────
+
+from langchain_groq import ChatGroq
+
+llm = ChatGroq(
+    api_key=os.getenv("GROQ_API_KEY"),
+    model="llama-3.1-8b-instant",
+    temperature=0,
+    max_tokens=1024,
+    timeout=60,
+    max_retries=5,
+)
+
+
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -62,18 +233,73 @@ ROUTER_PROMPT = ChatPromptTemplate.from_messages([
         "  direct_answer — A stable general knowledge question answerable from training data "
         "with no retrieval needed (e.g. 'What is softmax?', 'Who invented the transformer?', "
         "'Explain backpropagation.').\n\n"
-        "When in doubt between retrieve and direct_answer, prefer retrieve.\n\n"
-        "Return only the route field.",
+        "IMPORTANT: If the query contains phrases like 'as per the report', "
+        "'in the knowledge base', 'according to the paper', or similar — "
+        "ALWAYS classify as retrieve, never direct_answer."
+        "Return ONLY a JSON object like: {{\"route\": \"retrieve\"}}"
     ),
     ("human", "{query}"),
 ])
 
-router_chain = ROUTER_PROMPT | llm.with_structured_output(RouterDecision)
+router_chain = ROUTER_PROMPT | llm.with_structured_output(
+    RouterDecision, method="json_mode"
+)
+import re
+
+# PII patterns — add near your other constants at the top
+_PII_PATTERNS = [
+    (re.compile(r'\b[A-Z]{5}[0-9]{4}[A-Z]\b'), "PAN number"),
+    (re.compile(r'\b[2-9]{1}[0-9]{11}\b'), "Aadhaar number"),
+    (re.compile(r'\b[0-9]{10}\b'), "phone number"),
+    (re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'), "email address"),
+    (re.compile(r'\b(?:\d[ -]?){13,16}\b'), "credit/debit card number"),
+    (re.compile(r'\b[A-Z]{2}[0-9]{2}[A-Z0-9]{4}[0-9]{7}([A-Z0-9]?){0,16}\b'), "IFSC/bank account"),
+    (re.compile(r'\b[A-Z]{1}[0-9]{7}\b'), "passport number"),
+]
+
+def _detect_pii(text: str) -> list[str]:
+    """Return list of PII type names found in text."""
+    found = []
+    for pattern, label in _PII_PATTERNS:
+        if pattern.search(text):
+            found.append(label)
+    return found
+
+def _redact_pii(text: str) -> str:
+    """Redact detected PII from text before logging."""
+    for pattern, label in _PII_PATTERNS:
+        text = pattern.sub(f"[REDACTED {label.upper()}]", text)
+    return text
 
 
 def router_node(state: RAGState) -> dict:
+    session_id = state["session_id"]
+    validate_session_id(session_id)
+    check_rate_limit(session_id)
+
     query = state["messages"][-1].content
+
+    # ── PII Guardrail ──────────────────────────────────────────
+    pii_found = _detect_pii(query)
+    if pii_found:
+        pii_types = ", ".join(pii_found)
+        log_event("PII_DETECTED", session_id,
+                  f"types={pii_types} | query={_redact_pii(query)[:80]}")
+        safe_answer = (
+            f"⚠️ I noticed your message may contain sensitive personal information "
+            f"({pii_types}). For your safety, I can't process or store this information. "
+            f"Please rephrase your question without sharing personal details."
+        )
+        return {
+            "route": "direct_answer",
+            "answer": safe_answer,
+        }
+    # ──────────────────────────────────────────────────────────
+
+    increment_llm_calls(session_id, "router")
+    log_event("ROUTER_NODE", session_id, f"query_len={len(query)}")
     decision: RouterDecision = router_chain.invoke({"query": query})
+    log_event("ROUTE_DECISION", session_id, f"route={decision.route}")
     return {"route": decision.route}
 
 
@@ -81,12 +307,12 @@ def router_node(state: RAGState) -> dict:
 
 class RetrieverInput(BaseModel):
     query: str = Field(description="Semantic query to search research paper chunks")
-    k: int = Field(default=4, ge=1, le=10, description="Number of chunks to retrieve")
+    k: int = Field(default=3, ge=1, le=5, description="Number of chunks to retrieve")
 
 
 class WebSearchInput(BaseModel):
     optimized_query: str = Field(description="Query rewritten and optimized for web search")
-    max_results: int = Field(default=3, ge=1, le=10, description="Number of web results to return")
+    max_results: int = Field(default=3, ge=1, le=5, description="Number of web results to return")
 
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
@@ -100,9 +326,13 @@ def retrieve_from_vectorstore(
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> list:
     """Search the uploaded research paper vector store for relevant passages."""
+    log_event("TOOL_CALL", session_id, f"tool=retrieve_from_vectorstore | k={k}")
     docs = vs_search(query=query, session_id=session_id, k=k)
     if not docs:
-        return [ToolMessage(content="No relevant documents found in the vector store.", tool_call_id=tool_call_id)]
+        log_event("RETRIEVAL_EMPTY", session_id, f"query={query[:80]}")
+        return [ToolMessage(content="No relevant documents found in the vector store.",
+                            tool_call_id=tool_call_id)]
+    log_event("RETRIEVAL_SUCCESS", session_id, f"chunks_found={len(docs)}")
     summary = f"Retrieved {len(docs)} chunk(s) from the vector store."
     return [
         ToolMessage(content=summary, tool_call_id=tool_call_id),
@@ -118,6 +348,8 @@ def web_search(
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> list:
     """Search the web for current or supplementary information using Tavily."""
+    log_event("TOOL_CALL", "web_search_tool",
+              f"tool=web_search | query={optimized_query[:80]}")
     client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
     results = client.search(optimized_query, max_results=max_results)
     if not results.get("results"):
@@ -139,23 +371,21 @@ def web_search(
 # ── Retrieval agent singletons ────────────────────────────────────────────────
 
 RETRIEVAL_TOOLS = [retrieve_from_vectorstore, web_search]
-retrieval_llm = llm.bind_tools(RETRIEVAL_TOOLS, parallel_tool_calls=False)
-base_tool_node = ToolNode(RETRIEVAL_TOOLS)
+retrieval_llm   = llm.bind_tools(RETRIEVAL_TOOLS, parallel_tool_calls=False)
+base_tool_node  = ToolNode(RETRIEVAL_TOOLS)
 
 RETRIEVE_SYSTEM = (
     "You are a research assistant gathering context to answer a user's question about research papers.\n\n"
     "You have two tools available and full control over how you use them:\n\n"
     "1. retrieve_from_vectorstore — searches the uploaded paper collection.\n"
-    "   You decide:\n"
-    "   - query: the semantic search query (phrase it to best match relevant paper chunks)\n"
-    "   - k: how many chunks to retrieve (1–10; use more for broad questions, fewer for specific ones)\n\n"
+    "   - query: the semantic search query\n"
+    "   - k: how many chunks to retrieve (1–5; use 2–3 for specific questions)\n\n"
     "2. web_search — searches the live web via Tavily.\n"
-    "   You decide:\n"
-    "   - optimized_query: rewrite the user's question as a concise, keyword-rich web search query\n"
-    "   - max_results: how many results to fetch (1–10)\n\n"
-    "Choose the right source based on the question:\n"
-    "- Questions about the uploaded papers → use retrieve_from_vectorstore\n"
-    "- Questions about current events, recent developments, or supplementary information → use web_search\n"
+    "   - optimized_query: concise keyword-rich web search query\n"
+    "   - max_results: how many results to fetch (1–5)\n\n"
+    "Choose the right source:\n"
+    "- Questions about uploaded papers → retrieve_from_vectorstore\n"
+    "- Current events or supplementary info → web_search\n"
     "- Call only one tool per turn.\n\n"
     "Do NOT produce a final answer. Only call tools to collect context."
 )
@@ -169,10 +399,15 @@ RELEVANCY_CHECK_SYSTEM = (
     "Return is_relevant=true if the chunks contain information that meaningfully "
     "addresses the question — even partially. "
     "Return is_relevant=false only if the chunks are clearly off-topic or contain "
-    "no useful information.\n\nBe lenient: if there is any substantive overlap, return true."
+    "no useful information.\n\nBe lenient: if there is any substantive overlap, return true.\n\n"
+    "You MUST respond with a JSON object containing exactly two fields:\n"
+    "{\"is_relevant\": true/false, \"reason\": \"one sentence explanation\"}"
+
+)
+relevancy_llm = llm.with_structured_output(
+    RelevancyDecision, method="json_mode"
 )
 
-relevancy_llm = llm.with_structured_output(RelevancyDecision)
 
 QUERY_REWRITE_SYSTEM = (
     "You are a query rewriting assistant for a research paper retrieval system. "
@@ -186,11 +421,11 @@ QUERY_REWRITE_SYSTEM = (
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 
 def agent_node(state: RAGState) -> dict:
+    session_id = state["session_id"]
     current_attempts = state.get("retrieval_attempts", 0)
-    # Once at the cap, use plain LLM so the agent cannot emit more tool calls.
-    # This prevents orphaned tool_call IDs from entering the persisted message history.
-    # retrieval llm --> tool call --> tool result
-    # llm --> no tools are bounded --> tool call
+    increment_llm_calls(session_id, "agent_node")
+    log_event("AGENT_NODE", session_id, f"retrieval_attempts={current_attempts}")
+
     lm = llm if current_attempts >= MAX_RETRIEVAL_ATTEMPTS else retrieval_llm
     messages = [{"role": "system", "content": RETRIEVE_SYSTEM}] + state["messages"]
     response = lm.invoke(messages)
@@ -201,37 +436,48 @@ def agent_node(state: RAGState) -> dict:
 
 
 def relevancy_check_node(state: RAGState) -> dict:
+    session_id = state["session_id"]
     query = state["query"]
-    docs = state.get("retrieved_docs") or []
+    docs  = state.get("retrieved_docs") or []
+    increment_llm_calls(session_id, "relevancy_check")
+
     doc_snippets = "\n\n---\n\n".join(doc.page_content[:300] for doc in docs[:3])
     if not doc_snippets:
+        log_event("RELEVANCY_SKIP", session_id, "no_docs_retrieved")
         return {"is_relevant": False}
+
     prompt = (
         f"Question: {query}\n\nRetrieved chunks:\n{doc_snippets}\n\n"
         "Are these chunks relevant to answering the question?"
     )
     decision: RelevancyDecision = relevancy_llm.invoke([
         {"role": "system", "content": RELEVANCY_CHECK_SYSTEM},
-        {"role": "user", "content": prompt},
+        {"role": "user",   "content": prompt},
     ])
+    log_event("RELEVANCY_DECISION", session_id, f"is_relevant={decision.is_relevant}")
     return {"is_relevant": decision.is_relevant}
 
 
 def query_rewrite_node(state: RAGState) -> dict:
+    session_id    = state["session_id"]
     original_query = state["query"]
-    rewrite_count = state.get("rewrite_count", 0)
-    response = llm.invoke([
+    rewrite_count  = state.get("rewrite_count", 0)
+    increment_llm_calls(session_id, "query_rewrite")
+    log_event("QUERY_REWRITE", session_id, f"rewrite_count={rewrite_count}")
+
+    response  = llm.invoke([
         {"role": "system", "content": QUERY_REWRITE_SYSTEM},
-        {"role": "user", "content": f"Original query: {original_query}\n\nWrite an improved search query."},
+        {"role": "user",   "content": f"Original query: {original_query}\n\nWrite an improved search query."},
     ])
-    rewritten = response.content.strip()
+    rewritten = sanitize_output(response.content.strip(), session_id)
+    log_event("QUERY_REWRITTEN", session_id, f"new_query={rewritten[:80]}")
     return {
-        "messages": [HumanMessage(content=rewritten)],
-        "query": rewritten,
-        "retrieved_docs": [],
+        "messages":           [HumanMessage(content=rewritten)],
+        "query":              rewritten,
+        "retrieved_docs":     [],
         "retrieval_attempts": 0,
-        "rewrite_count": rewrite_count + 1,
-        "is_relevant": None,
+        "rewrite_count":      rewrite_count + 1,
+        "is_relevant":        None,
     }
 
 
@@ -248,26 +494,27 @@ CLAIM_ANALYSIS_PROMPT = (
     "- verdict_summary should be 1-2 sentences suitable for display to the user."
 )
 
-verification_llm = llm.with_structured_output(ClaimVerificationResult)
+verification_llm = llm.with_structured_output(
+    ClaimVerificationResult, method="json_mode"
+)
 
 
 def verify_claim_node(state: RAGState) -> dict:
-    claim = state["messages"][-1].content
+    session_id = state["session_id"]
+    claim      = state["messages"][-1].content
+    increment_llm_calls(session_id, "verify_claim")
+    log_event("VERIFY_CLAIM", session_id, f"claim_len={len(claim)}")
+
     tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 
-    # General web search for recent work superseding the claim
     general_results = tavily_client.search(
-        f"recent research superseding: {claim[:200]}",
-        max_results=5,
+        f"recent research superseding: {claim[:200]}", max_results=5,
     ).get("results", [])
 
-    # arXiv-targeted search via web to get paper titles and links
     arxiv_results = tavily_client.search(
-        f"site:arxiv.org {claim[:200]}",
-        max_results=5,
+        f"site:arxiv.org {claim[:200]}", max_results=5,
     ).get("results", [])
 
-    # Build context block
     lines = ["=== General Web Search Results ==="]
     for r in general_results:
         lines.append(
@@ -275,7 +522,6 @@ def verify_claim_node(state: RAGState) -> dict:
             f"URL: {r['url']}\n"
             f"Snippet: {r.get('content', '')[:300]}\n"
         )
-
     lines.append("=== arXiv Paper Search Results ===")
     for r in arxiv_results:
         lines.append(
@@ -285,8 +531,7 @@ def verify_claim_node(state: RAGState) -> dict:
         )
 
     context = "\n".join(lines)
-
-    prompt = (
+    prompt  = (
         f"{CLAIM_ANALYSIS_PROMPT}\n\n"
         f"Claim to verify:\n{claim}\n\n"
         f"Search Results:\n{context}"
@@ -297,15 +542,25 @@ def verify_claim_node(state: RAGState) -> dict:
 
     papers_dicts = [p.model_dump() for p in result.superseding_papers[:3]]
     return {
-        "claim_verdict": result.verdict_summary,
-        "claim_source": papers_dicts[0]["url"] if papers_dicts else None,
+        "claim_verdict":      result.verdict_summary,
+        "claim_source":       papers_dicts[0]["url"] if papers_dicts else None,
         "superseding_papers": papers_dicts,
     }
 
 
 def generate_answer_node(state: RAGState) -> dict:
-    route = state.get("route")
-    query = state["query"]
+    session_id = state["session_id"]
+
+    # If PII guardrail already set the answer, return it directly
+    if state.get("answer") and state.get("route") == "direct_answer":
+        existing = state["answer"]
+        if "sensitive personal information" in existing:
+            return {"answer": existing,
+                    "messages": [AIMessage(content=existing)]}
+    route      = state.get("route")
+    query      = state["query"]
+    increment_llm_calls(session_id, "generate_answer")
+    log_event("GENERATE_ANSWER", session_id, f"route={route}")
 
     if route == "retrieve":
         if state.get("is_relevant") is False and state.get("rewrite_count", 0) >= 1:
@@ -319,13 +574,13 @@ def generate_answer_node(state: RAGState) -> dict:
             if not docs:
                 answer = "I don't know the answer."
             else:
-                context = "\n\n---\n\n".join(doc.page_content for doc in docs)
-                prompt = f"Answer the question using this context:\n\n{context}\n\nQuestion: {query}"
+                # Context length management: trim + inject medium-length instruction
+                prompt = build_context_and_prompt(docs, query)
                 answer = llm.invoke([{"role": "user", "content": prompt}]).content
 
     elif route == "verify_claim":
-        verdict = state.get("claim_verdict", "")
-        papers = state.get("superseding_papers") or []
+        verdict    = state.get("claim_verdict", "")
+        papers     = state.get("superseding_papers") or []
         claim_text = state["query"]
         if papers:
             papers_block = "\n\n".join(
@@ -350,9 +605,16 @@ def generate_answer_node(state: RAGState) -> dict:
             )
 
     else:  # direct_answer
-        prompt = f"Answer from your knowledge.\n\nQuestion: {query}"
+        prompt = (
+            "Answer the question directly in 2–4 sentences. "
+            "Be concise and include only what's directly relevant.\n\n"
+            f"Question: {query}"
+        )
         answer = llm.invoke([{"role": "user", "content": prompt}]).content
 
+    # Output sanitization — applied to every answer before it leaves the graph
+    answer = sanitize_output(answer, session_id)
+    log_event("ANSWER_GENERATED", session_id, f"answer_len={len(answer)}")
     return {"answer": answer, "messages": [AIMessage(content=answer)]}
 
 
@@ -366,9 +628,6 @@ def route_query(state: RAGState) -> str:
 
 
 def agent_routing(state: RAGState) -> str:
-    # Always execute pending tool calls first — shortcutting here would leave
-    # an AIMessage with tool_calls unmatched by ToolMessages in the checkpointer,
-    # corrupting history for all future turns in the same session.
     tc = tools_condition(state)
     if tc == "tools":
         return "retrieval"
@@ -386,50 +645,37 @@ def after_relevancy_routing(state: RAGState) -> str:
 
 
 def build_graph(db_path: str = "checkpoints.db"):
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn        = sqlite3.connect(db_path, check_same_thread=False)
     checkpointer = SqliteSaver(conn)
 
     graph = StateGraph(RAGState)
-    graph.add_node("router", router_node)
-    graph.add_node("agent_node", agent_node)
-    graph.add_node("retrieval", base_tool_node)
+    graph.add_node("router",          router_node)
+    graph.add_node("agent_node",      agent_node)
+    graph.add_node("retrieval",       base_tool_node)
     graph.add_node("relevancy_check", relevancy_check_node)
-    graph.add_node("query_rewrite", query_rewrite_node)
-    graph.add_node("verify_claim", verify_claim_node)
+    graph.add_node("query_rewrite",   query_rewrite_node)
+    graph.add_node("verify_claim",    verify_claim_node)
     graph.add_node("generate_answer", generate_answer_node)
 
     graph.set_entry_point("router")
 
     graph.add_conditional_edges(
-        "router",
-        route_query,
-        {
-            "retrieve": "agent_node",
-            "verify_claim": "verify_claim",
-            "direct_answer": "generate_answer",
-        },
+        "router", route_query,
+        {"retrieve": "agent_node", "verify_claim": "verify_claim",
+         "direct_answer": "generate_answer"},
     )
-
     graph.add_conditional_edges(
-        "agent_node",
-        agent_routing,
-        {
-            "retrieval": "retrieval",
-            "relevancy_check": "relevancy_check",
-            "generate_answer": "generate_answer",
-        },
+        "agent_node", agent_routing,
+        {"retrieval": "retrieval", "relevancy_check": "relevancy_check",
+         "generate_answer": "generate_answer"},
     )
     graph.add_edge("retrieval", "agent_node")
-
     graph.add_conditional_edges(
-        "relevancy_check",
-        after_relevancy_routing,
+        "relevancy_check", after_relevancy_routing,
         {"query_rewrite": "query_rewrite", "generate_answer": "generate_answer"},
     )
-    graph.add_edge("query_rewrite", "agent_node")
-
-    graph.add_edge("verify_claim", "generate_answer")
+    graph.add_edge("query_rewrite",   "agent_node")
+    graph.add_edge("verify_claim",    "generate_answer")
     graph.add_edge("generate_answer", END)
 
     return graph.compile(checkpointer=checkpointer)
-

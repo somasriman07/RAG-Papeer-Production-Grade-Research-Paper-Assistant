@@ -1,5 +1,6 @@
 import json
 import tempfile
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ from backend.paper_loader import load_arxiv, load_document, load_webpage
 from backend.rag_graph import build_graph
 from backend.vector_store import add_paper, list_papers
 
+
 st.set_page_config(page_title="Papeer", page_icon="📚", layout="centered")
 
 
@@ -22,7 +24,11 @@ def get_graph():
 
 
 SESSIONS_FILE = Path("sessions.json")
-_rename_llm = ChatOpenAI(model="gpt-5-mini")
+_rename_llm = ChatOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    model="qwen/qwen3-32b"
+)
 
 
 def load_sessions() -> dict:

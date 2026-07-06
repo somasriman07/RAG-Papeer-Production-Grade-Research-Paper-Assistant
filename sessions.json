@@ -1,1 +1,32 @@
-{}
+{
+  "f47bbcf6-f8e2-4522-a829-6130ccf42ee5": {
+    "id": "f47bbcf6-f8e2-4522-a829-6130ccf42ee5",
+    "name": "sriman introduction chat",
+    "created_at": "2026-06-30T10:06:04.838523",
+    "is_named": true
+  },
+  "220360c6-dddf-4d46-8164-1d190a7377c8": {
+    "id": "220360c6-dddf-4d46-8164-1d190a7377c8",
+    "name": "Primary Paper Architecture",
+    "created_at": "2026-06-30T10:42:20.929382",
+    "is_named": true
+  },
+  "8ee521e4-688f-466d-a5a9-cf8d7cdcaf12": {
+    "id": "8ee521e4-688f-466d-a5a9-cf8d7cdcaf12",
+    "name": "Hyderabad Weather Forecast",
+    "created_at": "2026-06-30T12:04:03.954191",
+    "is_named": true
+  },
+  "b77604d2-4448-498f-99ef-0aa0b1caeadb": {
+    "id": "b77604d2-4448-498f-99ef-0aa0b1caeadb",
+    "name": "PAN Number Confirmation",
+    "created_at": "2026-07-06T09:55:30.075016",
+    "is_named": true
+  },
+  "db1248ce-9292-4ff8-b19b-3ccbcc846a8b": {
+    "id": "db1248ce-9292-4ff8-b19b-3ccbcc846a8b",
+    "name": "Chemistry of Explosives",
+    "created_at": "2026-07-06T10:34:28.542612",
+    "is_named": true
+  }
+}
