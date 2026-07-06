@@ -13,9 +13,13 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from rank_bm25 import BM25Okapi
+import torch
 from sentence_transformers import CrossEncoder
 
 load_dotenv()
+
+# Detect best hardware acceleration device
+DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 EMBEDDING_DIM    = 1024
@@ -49,7 +53,7 @@ _child_splitter = RecursiveCharacterTextSplitter(
 # ── Embeddings ────────────────────────────────────────────────────────────────
 base_embeddings = HuggingFaceEmbeddings(
     model_name="BAAI/bge-m3",
-    model_kwargs={"device": "mps", "trust_remote_code": True},
+    model_kwargs={"device": DEVICE, "trust_remote_code": True},
     encode_kwargs={"normalize_embeddings": True},
 )
 embedding_file_store = LocalFileStore("./cache/embeddings")
@@ -78,7 +82,7 @@ def _get_reranker() -> CrossEncoder:
     if _reranker is None:
         _reranker = CrossEncoder(
             "BAAI/bge-reranker-base",
-            device="mps",
+            device=DEVICE,
             max_length=512,
         )
     return _reranker
