@@ -3,6 +3,9 @@ FROM python:3.12
 WORKDIR /app
 
 # ── Layer 1: install deps (cached until requirements.txt changes) ─────────────
+# Install CPU-only PyTorch first to avoid massive CUDA downloads (reduces size by 4GB+ and builds faster)
+RUN pip install --no-cache-dir torch==2.12.1 torchvision==0.27.1 --index-url https://download.pytorch.org/whl/cpu
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
